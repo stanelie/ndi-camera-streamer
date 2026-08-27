@@ -1,0 +1,27 @@
+# Build outputs
+build/
+app/build/
+*.apk
+*.aab
+.cxx/
+
+# Local machine config (contains SDK path)
+local.properties
+
+# Gradle caches
+.gradle/
+gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# OS
+.DS_Store
+
+# Vendored NDI SDK — proprietary, not ours to redistribute. Re-fetch via
+# scripts/vendor_ndi_sdk.sh after a fresh checkout.
+app/src/main/cpp/ndi-include/
+app/src/main/jniLibs/
