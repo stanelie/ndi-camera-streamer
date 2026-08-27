@@ -174,6 +174,30 @@ this API 26 device they are inert; the vendor keys cover older hardware but are 
 than branching on `Build.HARDWARE`, since unrecognised keys are ignored and SoC detection is
 what silently breaks on the next device. On API 31+ the codec is asked which it supports.
 
+## Open: Millumin sometimes slow to connect
+
+Not yet reproduced on demand, so not yet diagnosed — recorded so the next occurrence has
+somewhere to start instead of beginning cold.
+
+Ruled out directly:
+- App-side startup latency. NDI sender is ready ~13ms after `startCapture()`, and both encoders
+  are producing frames within ~700ms. Too fast to explain a noticeable wait on its own.
+- A changing listen port across app restarts. Confirmed via `netstat` on the device: the port
+  (5960/5961) is identical across separate launches, so it is not mDNS holding a stale port.
+
+Two live candidates, pointing at different fixes, so it matters which one actually happens:
+- **Stale connection after an ungraceful exit.** If the process dies without
+  `NdiSender.stop()` running (force-stop, crash, OS kill under memory pressure) no clean NDI
+  "goodbye" is sent, and Millumin may hold a dead connection until its own timeout expires
+  before retrying. Fixable app-side, e.g. hooking `onDestroy`/`onTaskRemoved` more defensively.
+- **mDNS/Wi-Fi discovery variability.** NDI discovery is UDP multicast, which has no delivery
+  guarantee; AP-level IGMP snooping, packet loss, or channel congestion can occasionally stretch
+  the query/response round-trip. Largely outside the app's control.
+
+Next time it happens, the useful facts to capture: had the app just been restarted (and how —
+task-switcher, crash, normal exit), had the screen been off first, and whether Millumin itself
+had been freshly reopened or was already running.
+
 ## Status
 
 Working end to end: the S7 streams NDI|HX to Millumin at 30fps, with the operator viewfinder
