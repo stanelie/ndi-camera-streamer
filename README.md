@@ -225,6 +225,20 @@ connects — consistent with a plain timer started at instance creation.
 **The fix is a commercial NDI vendor license** (`licensing@ndi.video`), which is needed for any
 real use of this SDK anyway.
 
+### What actually resets the clock: a full process restart, not just the instance
+
+Directly tested (temporary debug-only code, added and then removed once answered — see git
+history): does destroying and recreating just the `NDIlib_send_instance_t` in place — same
+process, same `NDIlib_initialize()` call, camera/encoder untouched — reset the 5-minute clock,
+or does it live somewhere `nativeCreate` doesn't reach?
+
+It does not reset it. Recreated the instance in place right after the cutoff fired; an
+independent receiver got 0 frames both immediately after and ~35s after. **Only a full app
+restart (new process) has ever been observed to reset it.** So there is no lighter-weight
+recovery action available than what's already documented above — restarting the app is not a
+convenience shortcut, it's the only thing that works, because the clock lives above the level a
+single sender instance owns.
+
 ### Removed: the proactive instance-restart workaround
 
 Earlier revisions recreated the NDI sender instance every 28 minutes to stay under what was

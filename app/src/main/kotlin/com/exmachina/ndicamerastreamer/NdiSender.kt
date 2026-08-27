@@ -5,21 +5,22 @@ import android.util.Log
 private const val TAG = "NdiSender"
 
 // The NDI Advanced SDK's development/trial license silently stops delivering a stream to
-// receivers after some quota is exhausted (our own send calls keep "succeeding" — nothing on
-// our side errors — but nothing reaches a connecting receiver either, indefinitely). Confirmed
-// directly from the SDK's own stdout: "This version of the NDI Advanced SDK is designed for
-// development use and will run on a stream for 30 minutes."
+// receivers after 5 minutes on mobile platforms (documented at
+// docs.ndi.video/all/developing-with-ndi/sdk/licensing, and confirmed on this device to
+// sub-second precision — see README). Our own send calls keep "succeeding" the whole time —
+// nothing on our side errors — but nothing reaches a connecting receiver either, until a fresh
+// app process starts (confirmed: an app restart alone resets it, no reboot required).
 //
-// This file previously tried to work around that by proactively recreating the NDI sender
-// instance every 28 minutes, on the theory the quota was per-instance/per-stream. Removed:
-// directly measured that the quota is NOT reset by recreating the instance, nor by restarting
-// the whole app process — the warning fired only 5 minutes into a brand new process with a
-// brand new instance, and a receiver got zero frames from it for a while after. The only thing
-// confirmed (empirically, via a real device reboot mid-failure) to reset it is a full device
-// reboot, which points at something cumulative and more persistent than "per stream." Still
-// investigating exactly what it's keyed on — see README's "30-minute trial limit" section for
-// the current state of that. A commercial NDI vendor license (licensing@ndi.video) would remove
-// the limit outright.
+// An earlier revision proactively recreated the NDI sender instance every 28 minutes, on the
+// wrong belief that the limit was ~30 minutes and per-instance. Removed — it was built on a
+// wrong model and could not have worked, and there's a real license question inherent in any
+// code whose purpose is to reset this timer before it fires. A commercial NDI vendor license
+// (licensing@ndi.video) is the actual fix.
+//
+// Confirmed directly (destroy+recreate in place, same process, camera/encoder untouched, then
+// removed once answered — see git history) that recreating just the instance does NOT reset the
+// clock: a receiver got 0 frames both immediately after and ~35s after such a recreate. Only a
+// full app restart (new process) has ever been observed to reset it.
 
 /**
  * Kotlin face of the JNI bridge in app/src/main/cpp/ndi_jni.cpp, which wraps libndi_advanced.so
