@@ -265,12 +265,13 @@ class CameraCapture(
                 // is still a useful floor.
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                // Baseline, not Main: Baseline prohibits B-frames outright, and B-frames cost a
-                // frame of decoder reordering delay. KEY_MAX_B_FRAMES would be the direct way to
-                // suppress them but needs API 29 — this device is API 26, so the profile is the
-                // only lever that actually applies here. Costs some coding efficiency (CAVLC
-                // instead of CABAC) for a guaranteed-no-reorder stream.
-                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                // Main rather than Baseline: Main allows CABAC (~10-15% better coding efficiency
+                // than Baseline's CAVLC). Main also *permits* B-frames, which would cost a frame
+                // of decoder reordering delay — but the drain loop watches output PTS ordering
+                // and warns if any appear, and none do on this encoder. If that warning ever
+                // fires on other hardware, drop to AVCProfileBaseline (which cannot emit them)
+                // or set KEY_MAX_B_FRAMES=0 where API 29+ is available.
+                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
                 setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
                 setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
                 // B-frames force the decoder to reorder, adding at least a frame of display

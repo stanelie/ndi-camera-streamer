@@ -102,10 +102,15 @@ rejects the spec's 640x360, so the size is negotiated from the camera's supporte
 runtime). Hardware H.264 encode costs ~37% of one core, against ~181% and ~143 Mbps when
 standard NDI's software compressor was doing the work.
 
-Bitrate currently lands ~2.5 Mbps rather than the 3.5 Mbps target, a side effect of Baseline
-profile plus low-latency rate control. Baseline was adopted to rule out B-frames, but none were
-being emitted, so it buys nothing here — reverting to Main would restore compression efficiency
-at identical latency, if quality matters more than the margin.
+Bitrate lands ~2.1-2.7 Mbps rather than the 3.5 Mbps target. This is the encoder's low-latency
+rate control, not the profile — it is unchanged between Baseline and Main. Raise `BITRATE` in
+`MainActivity.kt` if the picture needs more bits.
+
+The encoder uses Main profile (CABAC, ~10-15% better coding efficiency than Baseline's CAVLC).
+Main permits B-frames, which would add a frame of decoder reordering delay, but this encoder
+emits none — verified by watching output PTS ordering over ~20s of streaming. That check is
+permanent: `OUT-OF-ORDER PTS` in logcat means some other device's encoder is reordering, and the
+fix is Baseline profile (which cannot emit B-frames) or `KEY_MAX_B_FRAMES=0` on API 29+.
 
 Video only, no audio yet. Bitrate is fixed at 3.5 Mbps CBR (`MainActivity.kt`), matching
 EpocCam-streamer's HD target — NDI|HX's FourCC tag ("highest_bandwidth" vs
