@@ -2,13 +2,16 @@ package com.exmachina.ndicamerastreamer
 
 import android.Manifest
 import android.app.Activity
+import android.app.ActivityManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.util.Log
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.SurfaceHolder
+import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
@@ -43,6 +46,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var previewView: AspectRatioSurfaceView
     private lateinit var surfaceHolder: SurfaceHolder
     private lateinit var focusModeButton: Button
+    private lateinit var lockButton: Button
+    private lateinit var lockedBadge: TextView
+
+    // App pinning (screen pinning / lock-task mode) — for a phone left unattended for the
+    // length of a show, so a stray touch can't back out to the launcher or notification shade
+    // and drop the stream. Polled rather than event-driven because Android has no callback for
+    // lock-task state changes; see unlockPollRunnable.
+    private var locked = false
+    private var pinningConfirmed = false
+    private val unlockPollHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
     // false = continuous autofocus (HAL refocuses on its own).
     // true  = tap-to-focus: the lens is driven once and locked, and each tap re-locks.
@@ -92,6 +105,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             else false
         }
 
+        lockButton = findViewById(R.id.lockButton)
+        lockedBadge = findViewById(R.id.lockedBadge)
+        lockButton.setOnClickListener { enableLock() }
+
         val needed = mutableListOf(Manifest.permission.CAMERA)
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
             needed += Manifest.permission.POST_NOTIFICATIONS
@@ -119,6 +136,57 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         focusInProgress = false
         focusTimeoutHandler.removeCallbacksAndMessages(null)
         focusModeButton.text = if (focused) "MF" else "MF?"
+    }
+
+    private val unlockPollRunnable = object : Runnable {
+        override fun run() {
+            if (!locked) return
+            val state = getSystemService(ActivityManager::class.java).lockTaskModeState
+            if (state == ActivityManager.LOCK_TASK_MODE_PINNED ||
+                state == ActivityManager.LOCK_TASK_MODE_LOCKED) {
+                // startLockTask() is asynchronous; this confirms the OS actually entered the
+                // mode before disableLock() is allowed to trust a later NONE reading as a real
+                // unpin rather than pinning simply not having taken effect yet.
+                pinningConfirmed = true
+            } else if (state == ActivityManager.LOCK_TASK_MODE_NONE && pinningConfirmed) {
+                disableLock()
+                return
+            }
+            unlockPollHandler.postDelayed(this, 500)
+        }
+    }
+
+    private fun enableLock() {
+        locked = true
+        pinningConfirmed = false
+        lockButton.visibility = View.GONE
+        lockedBadge.visibility = View.VISIBLE
+        startLockTask()
+        unlockPollHandler.postDelayed(unlockPollRunnable, 500)
+    }
+
+    private fun disableLock() {
+        locked = false
+        unlockPollHandler.removeCallbacks(unlockPollRunnable)
+        lockedBadge.visibility = View.GONE
+        lockButton.visibility = View.VISIBLE
+    }
+
+    // While locked, swallow touches/keys before they reach the system (Back, Recents, the
+    // notification shade edge-swipe) rather than relying on lock-task mode alone to block them —
+    // matches EpocCam-streamer, where lock-task alone was found not to be enough on this class
+    // of device/launcher combination.
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (locked) return true
+        return super.dispatchTouchEvent(ev)
+    }
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (locked) return true
+        return super.onKeyDown(keyCode, event)
+    }
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        if (locked) return true
+        return super.onKeyUp(keyCode, event)
     }
 
     override fun onRequestPermissionsResult(req: Int, perms: Array<String>, results: IntArray) {

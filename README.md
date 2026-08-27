@@ -127,6 +127,26 @@ without a camera-typed foreground service; the service is declared
 `foregroundServiceType="camera"` for that reason, but if this is ever run on a newer device and
 the feed stops on backgrounding, moving capture into the service is the fix.
 
+## App pinning (unattended operation)
+
+A LOCK button, lower-right, engages Android's screen pinning (lock-task mode) so a phone left
+unattended for a show can't be backed out of the app by a stray touch, a notification-shade
+swipe, or Recents. Ported from EpocCam-streamer, where the same control was needed for the same
+reason.
+
+Tap LOCK, confirm the one-time system "Turn on Pin windows" dialog (Android's own OS-level
+consent, shown once per pinning session — not something the app can skip), and the badge
+switches to **LOCKED**. While locked, `dispatchTouchEvent`/`onKeyDown`/`onKeyUp` swallow input
+before it reaches the system as an extra layer on top of lock-task mode itself. To unlock: the
+standard Android gesture (hold Back + Recents together), which is intentionally not something
+the app can trigger from inside itself — that's the point of pinning.
+
+Android has no callback for lock-task state changes, so `unlockPollRunnable` polls
+`lockTaskModeState` every 500ms and flips the UI back once it sees `NONE`. Verified end to end
+on the S7: engaging shows `PINNED` and suppresses Back; forcing lock-task off at the OS level
+(`am task lock stop`) produces Android's "App unpinned" toast and the UI correctly reverts to
+the LOCK button.
+
 ## Latency
 
 Glass-to-glass measured in Millumin, on a Galaxy S7 (Exynos, API 26).
