@@ -67,6 +67,25 @@ Things that were investigated and are **not** the cause — recorded so they are
   failures on **stdout**, which Android discards. `redirectStdioToLogcat` in `ndi_jni.cpp` pipes
   it into logcat, which is how the I-frame timing violation below was found. Keep it.
 
+## Qualcomm ~1s latency (Pixel 5, and any Qualcomm device)
+
+Feeding the camera straight into `MediaCodec.createInputSurface()` is the documented zero-copy
+path, but on Qualcomm devices that surface's `USAGE_VIDEO_ENCODE` HardwareBuffer flag puts the
+driver into a mode that holds ~1s of frames, independent of any MediaCodec/CaptureRequest
+tuning — see [Google Issue Tracker #254027327](https://issuetracker.google.com/issues/254027327),
+closed "Won't Fix (Obsolete)" with no platform fix. Confirmed directly on a Pixel 5.
+
+Fixed the same way EpocCam-streamer already had it: on Qualcomm hardware the camera targets an
+`ImageReader` instead, and each frame is forwarded to the encoder via `ImageWriter` — a zero-copy
+GPU handoff that avoids the flag.
+
+**Gated to Qualcomm on purpose.** The same path produces solid green frames on Exynos (seen
+previously on a Samsung S6), so a version-only gate would break the S7 this app targets.
+`IS_QUALCOMM` in `CameraCapture.kt` checks `Build.SOC_MANUFACTURER` (API 31+) and falls back to
+`Build.HARDWARE` ("qcom") on older devices. Confirmed on both phones this app has actually run
+on: S7 stays on the direct-Surface path (unaffected), Pixel 5 takes the ImageReader path
+(latency fixed).
+
 ## Operator controls
 
 A focus-mode button sits top-right on the phone:
