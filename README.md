@@ -102,15 +102,27 @@ rejects the spec's 640x360, so the size is negotiated from the camera's supporte
 runtime). Hardware H.264 encode costs ~37% of one core, against ~181% and ~143 Mbps when
 standard NDI's software compressor was doing the work.
 
-Bitrate lands ~2.1-2.7 Mbps rather than the 3.5 Mbps target. This is the encoder's low-latency
-rate control, not the profile — it is unchanged between Baseline and Main. Raise `BITRATE` in
-`MainActivity.kt` if the picture needs more bits.
+The encoder uses **Main** profile. Both profiles were measured end to end in Millumin:
 
-The encoder uses Main profile (CABAC, ~10-15% better coding efficiency than Baseline's CAVLC).
-Main permits B-frames, which would add a frame of decoder reordering delay, but this encoder
-emits none — verified by watching output PTS ordering over ~20s of streaming. That check is
-permanent: `OUT-OF-ORDER PTS` in logcat means some other device's encoder is reordering, and the
-fix is Baseline profile (which cannot emit B-frames) or `KEY_MAX_B_FRAMES=0` on API 29+.
+| | Baseline | Main (chosen) |
+|---|---|---|
+| Bitrate at the same quality ceiling | ~3.3 Mbps | ~2.1-2.7 Mbps |
+| Capture -> encode | ~100ms | ~99ms |
+| Glass-to-glass in Millumin | no perceptible difference | no perceptible difference |
+
+Latency is indistinguishable, so the decision came down to bandwidth: Main's CABAC entropy
+coding reaches the same quality (both hit the encoder's min-QP floor) for roughly 25% fewer
+bits. Bitrate lands under the 3.5 Mbps `BITRATE` target for that reason, not because the target
+is being missed; raise it in `MainActivity.kt` only if the picture actually needs more bits.
+
+Main *permits* B-frames, which would add a frame of decoder reordering delay, but this encoder
+emits none — verified by watching output PTS ordering. That check is permanent: `OUT-OF-ORDER
+PTS` in logcat means another device's encoder is reordering, and the fix is Baseline profile
+(which cannot emit them) or `KEY_MAX_B_FRAMES=0` on API 29+.
+
+Note that `PIPE LATENCY` only covers capture to encoder output on the phone. Decode cost lands
+on the receiver and is invisible to it, so profile changes must be judged end to end, not from
+that number alone.
 
 Video only, no audio yet. Bitrate is fixed at 3.5 Mbps CBR (`MainActivity.kt`), matching
 EpocCam-streamer's HD target — NDI|HX's FourCC tag ("highest_bandwidth" vs
