@@ -6,17 +6,34 @@
 // stream and just tunnels it, prefixed with an NDIlib_compressed_packet_t header, over the NDI
 // wire protocol. That's exactly what CameraCapture.kt's MediaCodec hardware encoder produces,
 // so this bridge is mostly plumbing: build the header, hand MediaCodec's Annex-B NAL bytes to
-// NDIlib_send_send_video_async_v2 as one contiguous buffer, done. No compression work happens
-// on the CPU here — it's all in the phone's hardware H.264 encoder ASIC, same as
-// EpocCam-streamer's approach, which is the whole reason this path exists (see the CPU/battery
-// numbers that motivated switching off standard NDI).
+// NDIlib_send_send_video_v2 as one contiguous buffer, done. No compression work happens on the
+// CPU here — it's all in the phone's hardware H.264 encoder ASIC, same as EpocCam-streamer's
+// approach, which is the whole reason this path exists (see the CPU/battery numbers that
+// motivated switching off standard NDI).
+//
+// Deliberately synchronous (NDIlib_send_send_video_v2), not async. This app tried async sending
+// (NDIlib_send_send_video_async_v2) for a while, on the theory that it would keep the encoder
+// drain thread from blocking on the network path. Measured end to end in Millumin: no
+// perceptible latency difference. It did, however, cause two distinct real bugs around buffer
+// lifetime — async hands the SDK a pointer and returns immediately, and the buffer must stay
+// valid until the SDK is actually done with it:
+//   1. A fixed-size rotation (3 buffers, reused blindly in order) could be overwritten while
+//      the SDK still referenced a buffer for a stalled/ungracefully-disconnected receiver,
+//      corrupting what got sent and plausibly explaining a real "won't reconnect" bug.
+//   2. The documented fix for that (NDIlib_send_set_video_async_completion, growing a pool and
+//      reusing a slot only once the SDK confirms it via callback) turned out to have a worse
+//      failure mode in this exact usage: with no active receiver connected, the completion
+//      callback was never observed to fire at all, so the pool grew without bound — over
+//      26,000 buffers and ~340MB in one real run before it was caught.
+// With zero measured benefit and two real bugs from the async path, synchronous sending is the
+// correct call: NDIlib_send_send_video_v2 copies/consumes the buffer before returning, so a
+// single reused buffer is unambiguously safe to overwrite on the very next call. No pool, no
+// completion tracking, no way for this class of bug to recur.
 
 #include <jni.h>
 #include <android/log.h>
 #include <atomic>
 #include <cstring>
-#include <memory>
-#include <mutex>
 #include <pthread.h>
 #include <unistd.h>
 #include <vector>
@@ -30,60 +47,11 @@
 namespace {
 std::atomic<bool> g_ndiInitialized{false};
 
-// Async sending requires the frame's memory to stay valid until the SDK is done with it — but
-// NOT necessarily just until "the next call": per the SDK's own docs (Asynchronous Sending
-// Completions), if a receiver has disconnected ungracefully, the SDK can hold a buffer until
-// that connection internally times out, which is far longer than a handful of frames. A fixed
-// small rotation (this app's original approach: 3 slots, reused blindly in order) can overwrite
-// a buffer NDI still references for a stale connection — memory corruption that plausibly
-// explains a real bug this exact mechanism produced: after a receiver disconnected, a *new*
-// connection attempt would get zero video frames indefinitely, while this app's own encode/send
-// loop kept reporting healthy throughput throughout (confirmed by direct reproduction).
-//
-// Fixed properly per the SDK's documented mechanism: a completion handler
-// (NDIlib_send_set_video_async_completion) tells us exactly when each buffer is actually free,
-// and the pool grows on demand instead of guessing a fixed slot count.
-struct SendSlot {
-    std::vector<uint8_t> buf;
-    NDIlib_video_frame_v2_t frame{};
-    std::atomic<bool> inUse{false};
-};
-std::mutex g_poolMutex;  // guards g_pool; touched both by the sender thread and the SDK's own
-                         // completion-callback thread, which the docs say can be either
-std::vector<std::unique_ptr<SendSlot>> g_pool;
-
-// Called by the SDK (on its own thread — must stay quick and not lock permanently, per the
-// docs) once a submitted frame's buffer is no longer needed by any connection, including
-// stalled/disconnecting ones. Matches by pointer identity against the pool.
-void onAsyncSendComplete(void* /*p_opaque*/, const NDIlib_video_frame_v2_t* p_video_data) {
-    if (p_video_data == nullptr || p_video_data->p_data == nullptr) return;
-    std::lock_guard<std::mutex> lock(g_poolMutex);
-    for (auto& slot : g_pool) {
-        if (slot->buf.data() == p_video_data->p_data) {
-            slot->inUse.store(false);
-            return;
-        }
-    }
-}
-
-// Returns a slot guaranteed not in use by the SDK (grows the pool if every existing slot is
-// still claimed — e.g. several stalled/slow connections at once). No hard cap: at steady state
-// with one healthy connection this settles to ~2 slots, and even a pathological case sized in
-// the dozens is negligible memory next to one encoded frame's already-small footprint.
-SendSlot* claimSlot() {
-    std::lock_guard<std::mutex> lock(g_poolMutex);
-    for (auto& slot : g_pool) {
-        bool expected = false;
-        if (slot->inUse.compare_exchange_strong(expected, true)) return slot.get();
-    }
-    g_pool.push_back(std::make_unique<SendSlot>());
-    g_pool.back()->inUse.store(true);
-    if (g_pool.size() > 8) {
-        LOGE("send buffer pool grew to %zu — a receiver may be stalled/not disconnecting cleanly",
-             g_pool.size());
-    }
-    return g_pool.back().get();
-}
+// Reused for every send. Safe because NDIlib_send_send_video_v2 is synchronous — the SDK is
+// guaranteed done reading this buffer by the time the call returns, so overwriting it on the
+// next call (from the same, serialized caller — see NdiSender.sendCompressedFrame's
+// @Synchronized) can never race with anything still reading the previous contents.
+std::vector<uint8_t> g_sendBuf;
 
 // The NDI HX SDK reports stream-validation failures by printing to STDOUT (and says it will
 // terminate an invalid stream). Android sends a native process's stdout/stderr to /dev/null,
@@ -150,12 +118,6 @@ Java_com_exmachina_ndicamerastreamer_NdiSender_nativeCreate(
         LOGE("NDIlib_send_create_v2 failed");
         return 0;
     }
-
-    // Own buffer-lifetime tracking (see SendSlot above) instead of the SDK's default "safe until
-    // the next async call" assumption, which the docs say does not hold for stalled/ungracefully
-    // disconnected receivers.
-    NDIlib_send_set_video_async_completion(instance, nullptr, onAsyncSendComplete);
-
     LOGI("NDI|HX sender created");
     return reinterpret_cast<jlong>(instance);
 }
@@ -192,22 +154,16 @@ Java_com_exmachina_ndicamerastreamer_NdiSender_nativeSendCompressedFrame(
     packet.data_size = static_cast<uint32_t>(frameSize);
     packet.extra_data_size = static_cast<uint32_t>(extraSize);
 
-    // A slot the completion callback has confirmed free (see SendSlot/claimSlot above) — not a
-    // blind rotation, since the SDK can legitimately hold a buffer well past a few frames' worth
-    // of turnover if a receiver is stalled or disconnecting ungracefully.
-    SendSlot* slot = claimSlot();
-
     const size_t total = sizeof(packet) + static_cast<size_t>(frameSize) + static_cast<size_t>(extraSize);
-    slot->buf.resize(total);
-    uint8_t* dst = slot->buf.data();
+    g_sendBuf.resize(total);
+    uint8_t* dst = g_sendBuf.data();
     memcpy(dst, &packet, sizeof(packet));
     memcpy(dst + sizeof(packet), reinterpret_cast<const uint8_t*>(frameBytes) + frameOffset, frameSize);
     if (extraBytes != nullptr && extraSize > 0) {
         memcpy(dst + sizeof(packet) + frameSize, extraBytes, extraSize);
     }
 
-    NDIlib_video_frame_v2_t& videoFrame = slot->frame;
-    videoFrame = NDIlib_video_frame_v2_t{};
+    NDIlib_video_frame_v2_t videoFrame{};
     videoFrame.xres = width;
     videoFrame.yres = height;
     // An NDI|HX source is required to publish BOTH a full-bandwidth ("program") stream and a
@@ -227,9 +183,9 @@ Java_com_exmachina_ndicamerastreamer_NdiSender_nativeSendCompressedFrame(
     videoFrame.p_metadata = nullptr;
     videoFrame.timestamp = 0;
 
-    // Async: returns without waiting for the frame to be handed off, so the encoder drain
-    // thread isn't blocked on the network path. Matches the SDK's own HX reference sender.
-    NDIlib_send_send_video_async_v2(instance, &videoFrame);
+    // Synchronous: the SDK has finished reading g_sendBuf by the time this returns, so it is
+    // safe to overwrite on the next call. See the file header for why this replaced async.
+    NDIlib_send_send_video_v2(instance, &videoFrame);
 
     env->ReleaseByteArrayElements(jFrame, frameBytes, JNI_ABORT);
     if (extraBytes != nullptr) {
@@ -262,9 +218,6 @@ Java_com_exmachina_ndicamerastreamer_NdiSender_nativeDestroy(
         JNIEnv* /*env*/, jobject /*thiz*/, jlong ptr) {
     auto instance = reinterpret_cast<NDIlib_send_instance_t>(ptr);
     if (instance != nullptr) {
-        // Flush: a null async send waits for in-flight buffers to be released, so no slot is
-        // still being read when we tear down.
-        NDIlib_send_send_video_async_v2(instance, nullptr);
         NDIlib_send_destroy(instance);
         LOGI("NDI sender destroyed");
     }

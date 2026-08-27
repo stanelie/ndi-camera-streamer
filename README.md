@@ -174,6 +174,51 @@ this API 26 device they are inert; the vendor keys cover older hardware but are 
 than branching on `Build.HARDWARE`, since unrecognised keys are ignored and SoC detection is
 what silently breaks on the next device. On API 31+ the codec is asked which it supports.
 
+## The actual root cause of "won't reconnect": a 30-minute trial limit
+
+After the async-buffer fix above and its own follow-up, Millumin still couldn't reconnect. The
+real cause was hiding in a line of the SDK's own stdout, which had been read as boilerplate and
+ignored:
+
+```
+This version of the NDI Advanced SDK is designed for development use and will run on a stream
+for 30 minutes. For a commercial use license, please email licensing@ndi.video.
+```
+
+**The Advanced SDK's development license silently stops delivering a stream to receivers after
+30 minutes** — the sender's own encode/send loop keeps reporting healthy throughput the entire
+time (confirmed live, mid-failure), because nothing on the sending side actually errors. This
+explains everything, including why the async-buffer fix didn't help: it's a licensing gate
+inside Vizrt's closed library, unreachable by anything in this app's send code. "Restarting the
+app fixes it" was never about clearing corrupted state; it fixes it because a fresh process
+means a fresh `NDIlib_send_instance_t`, which resets the 30-minute timer.
+
+**Two real fixes, not mutually exclusive:**
+1. A commercial NDI vendor license (`licensing@ndi.video`) removes the limit outright.
+2. Until/unless that happens: `NdiSender` proactively recreates just the NDI sender instance
+   every 25 minutes — 5 minutes of margin under the SDK's cutoff — while the camera and encoder
+   keep running the entire time. See `NdiSender.restartInstance()`.
+
+### Why it isn't gapless
+
+The natural ask was to pre-warm a second instance under the same name before tearing down the
+first, so the new one's listener/mDNS advertisement is already live the instant the old
+connection drops. Tried it, and confirmed directly that the SDK rejects it outright:
+`NDIlib_send_create_v2` fails with a second live instance under the same source name. So the
+swap is destroy-then-create instead — there's a brief real window (bounded by a 250ms grace
+period plus however fast the receiver notices and reconnects) where no sender exists. Far
+smaller than a full app/camera restart, but not literally zero.
+
+The 250ms grace period before freeing the old instance exists because `isKeyframeRequired()`/
+`waitForKeyframeRequest()` are deliberately not synchronized with `sendCompressedFrame()` (so
+the keyframe thread's up-to-50ms native wait can never block the frame-send hot path) — a call
+already in flight when the pointer swaps may still be holding the old instance handle for a
+moment. The wait comfortably outlasts that.
+
+Verified directly (with the interval temporarily shortened for testing): camera/encoder frame
+throughput never paused across a swap, no crash, and the schedule correctly re-arms for
+repeated cycles.
+
 ## Fixed: reconnect after Millumin disconnect stopped working
 
 After running for a while, disconnecting Millumin and trying to reconnect would fail: the phone
