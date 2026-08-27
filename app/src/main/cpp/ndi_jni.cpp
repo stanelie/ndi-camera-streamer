@@ -47,6 +47,17 @@
 namespace {
 std::atomic<bool> g_ndiInitialized{false};
 
+// So stdoutPumpLoop (a plain pthread, not JNI-attached) can call back into Kotlin when it sees
+// the SDK's trial-limit message on stdout.
+JavaVM* g_jvm = nullptr;
+// Cached as a global ref from nativeCreate (called on a properly JNI-attached thread with the
+// app's own classloader) rather than looked up fresh in the pump thread: FindClass from a
+// thread the JVM didn't create (like a plain pthread attached via AttachCurrentThread) resolves
+// against the bootstrap classloader, not the app's, and silently fails to find app classes —
+// confirmed directly: the warning callback never fired and never logged anything, because
+// FindClass was returning null and the code correctly no-op'd on that instead of crashing.
+jclass g_ndiSenderClass = nullptr;
+
 // Reused for every send. Safe because NDIlib_send_send_video_v2 is synchronous — the SDK is
 // guaranteed done reading this buffer by the time the call returns, so overwriting it on the
 // next call (from the same, serialized caller — see NdiSender.sendCompressedFrame's
@@ -60,6 +71,26 @@ std::vector<uint8_t> g_sendBuf;
 int g_stdoutPipe[2];
 pthread_t g_stdoutThread;
 
+// Forwards a line seen on the SDK's stdout up to NdiSender.onNativeWarning(String) if it matches
+// a known trial/licensing message, so the UI can show it instead of the failure looking like an
+// unexplained network problem. Attaches this pthread to the JVM for the duration of the call —
+// cheap and infrequent (this only fires on the rare lines that match), so no need to keep it
+// attached permanently.
+void notifyJavaOfWarning(const char* line) {
+    if (!g_jvm || !g_ndiSenderClass) return;
+    JNIEnv* env = nullptr;
+    if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK || env == nullptr) return;
+
+    jmethodID mid = env->GetStaticMethodID(g_ndiSenderClass, "onNativeWarning", "(Ljava/lang/String;)V");
+    if (mid != nullptr) {
+        jstring jline = env->NewStringUTF(line);
+        env->CallStaticVoidMethod(g_ndiSenderClass, mid, jline);
+        env->DeleteLocalRef(jline);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    g_jvm->DetachCurrentThread();
+}
+
 void* stdoutPumpLoop(void*) {
     char buf[512];
     ssize_t n;
@@ -67,6 +98,13 @@ void* stdoutPumpLoop(void*) {
         if (buf[n - 1] == '\n') n--;   // logcat adds its own newline
         buf[n] = '\0';
         __android_log_write(ANDROID_LOG_WARN, "ndi_stdout", buf);
+        // Substring match on wording confirmed from the SDK's actual output (see README) rather
+        // than the whole line, so small wording variations across SDK versions don't silently
+        // stop surfacing this.
+        if (strstr(buf, "designed for development use") != nullptr ||
+            strstr(buf, "commercial use license") != nullptr) {
+            notifyJavaOfWarning(buf);
+        }
     }
     return nullptr;
 }
@@ -83,9 +121,25 @@ void redirectStdioToLogcat() {
 }
 }
 
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
+    g_jvm = vm;
+    return JNI_VERSION_1_6;
+}
+
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_exmachina_ndicamerastreamer_NdiSender_nativeCreate(
         JNIEnv* env, jobject /*thiz*/, jstring jSourceName, jstring jConfigJson) {
+    if (g_ndiSenderClass == nullptr) {
+        jclass localCls = env->FindClass("com/exmachina/ndicamerastreamer/NdiSender");
+        if (localCls != nullptr) {
+            g_ndiSenderClass = static_cast<jclass>(env->NewGlobalRef(localCls));
+            env->DeleteLocalRef(localCls);
+        } else {
+            LOGE("FindClass(NdiSender) failed — trial-limit UI warning will not fire");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+    }
+
     if (!g_ndiInitialized.exchange(true)) {
         redirectStdioToLogcat();   // before NDIlib_initialize, so we catch its output too
         if (!NDIlib_initialize()) {

@@ -174,50 +174,78 @@ this API 26 device they are inert; the vendor keys cover older hardware but are 
 than branching on `Build.HARDWARE`, since unrecognised keys are ignored and SoC detection is
 what silently breaks on the next device. On API 31+ the codec is asked which it supports.
 
-## The actual root cause of "won't reconnect": a 30-minute trial limit
+## The SDK trial limit: measured at 5 minutes, not the 30 the message claims
 
-After the async-buffer fix above and its own follow-up, Millumin still couldn't reconnect. The
-real cause was hiding in a line of the SDK's own stdout, which had been read as boilerplate and
-ignored:
+The Advanced SDK's development license silently stops delivering a stream to receivers. The
+sender's own encode/send loop keeps reporting healthy throughput the entire time (confirmed
+live, mid-failure), because nothing on the sending side errors — our `NDIlib_send_send_video_v2`
+calls keep "succeeding" while no receiver gets a frame. The only signal is a line on the SDK's
+own stdout (which is why the stdout->logcat pump in `ndi_jni.cpp` matters so much):
 
 ```
 This version of the NDI Advanced SDK is designed for development use and will run on a stream
 for 30 minutes. For a commercial use license, please email licensing@ndi.video.
 ```
 
-**The Advanced SDK's development license silently stops delivering a stream to receivers after
-30 minutes** — the sender's own encode/send loop keeps reporting healthy throughput the entire
-time (confirmed live, mid-failure), because nothing on the sending side actually errors. This
-explains everything, including why the async-buffer fix didn't help: it's a licensing gate
-inside Vizrt's closed library, unreachable by anything in this app's send code. "Restarting the
-app fixes it" was never about clearing corrupted state; it fixes it because a fresh process
-means a fresh `NDIlib_send_instance_t`, which resets the 30-minute timer.
+**The message says 30 minutes. Measured on this device, it is exactly 5.** Established by direct
+measurement, not inference:
 
-**Two real fixes, not mutually exclusive:**
-1. A commercial NDI vendor license (`licensing@ndi.video`) removes the limit outright.
-2. Until/unless that happens: `NdiSender` proactively recreates just the NDI sender instance
-   every 25 minutes — 5 minutes of margin under the SDK's cutoff — while the camera and encoder
-   keep running the entire time. See `NdiSender.restartInstance()`.
+| Observation | Evidence |
+| --- | --- |
+| Fires exactly 5:00 after `NDIlib_send_create_v2` | Three runs: 5:00.02, 5:00.26, 5:00.69 |
+| Not anchored to system uptime | Same 5:00 at 8h uptime and at 22s uptime |
+| Not anchored to receiver connection | Receiver connected 47s in; cutoff still 5:00 after *create* |
+| Coincides with real stream death | On-screen banner, Millumin failure, and an independent test receiver getting 0 frames in 20s — all together |
+| Reset by an app restart alone | Confirmed: restart (no reboot), Millumin reconnects immediately |
 
-### Why it isn't gapless
+Ruled out as explanations for the 6x discrepancy:
+- **Our timestamps.** The obvious suspect, since the SDK could derive stream duration from the
+  `pts`/`timecode` we supply. `CameraCapture` converts with `presentationTimeUs * 10L`, the
+  correct microseconds -> 100ns conversion, so our PTS tracks real time 1:1.
+- **A data-volume budget.** Untestable via the bitrate knob and probably false: the encoder
+  holds ~2.3 Mbps no matter what target it is given (12 Mbps requested, ~2.3 Mbps produced), so
+  bitrate cannot be used to vary volume, and the cutoff did not move.
 
-The natural ask was to pre-warm a second instance under the same name before tearing down the
-first, so the new one's listener/mDNS advertisement is already live the instant the old
-connection drops. Tried it, and confirmed directly that the SDK rejects it outright:
-`NDIlib_send_create_v2` fails with a second live instance under the same source name. So the
-swap is destroy-then-create instead — there's a brief real window (bounded by a 250ms grace
-period plus however fast the receiver notices and reconnects) where no sender exists. Far
-smaller than a full app/camera restart, but not literally zero.
+Best supported conclusion: the "30 minutes" text is generic boilerplate shared across the SDK,
+and the limit actually enforced on this build's NDI|HX compressed-send path is **5 minutes of
+wall-clock time per sender instance**. The sub-second precision across runs and the complete
+independence from uptime both point to a plain hard-coded timer started at instance creation
+rather than a budget of frames, bytes, or stream time.
 
-The 250ms grace period before freeing the old instance exists because `isKeyframeRequired()`/
-`waitForKeyframeRequest()` are deliberately not synchronized with `sendCompressedFrame()` (so
-the keyframe thread's up-to-50ms native wait can never block the frame-send hot path) — a call
-already in flight when the pointer swaps may still be holding the old instance handle for a
-moment. The wait comfortably outlasts that.
+**The fix is a commercial NDI vendor license** (`licensing@ndi.video`), which is needed for any
+real use of this SDK anyway.
 
-Verified directly (with the interval temporarily shortened for testing): camera/encoder frame
-throughput never paused across a swap, no crash, and the schedule correctly re-arms for
-repeated cycles.
+### Removed: the proactive instance-restart workaround
+
+Earlier revisions recreated the NDI sender instance every 28 minutes to stay under what was
+believed to be a 30-minute per-instance limit. That has been **removed**, for two reasons:
+
+1. **It was built on a wrong model of the limit** and could not have worked — the real cutoff is
+   at 5 minutes, so a 28-minute swap fires long after the stream is already dead. It also
+   introduced its own problem: each recreation caused an unpredictable receiver-visible
+   reconnect gap (measured between 4.8s and 24.8s) because NDI's listen port churns across
+   in-process recreations.
+2. **Resetting that timer before it fires is circumventing the license**, not fixing a bug. Code
+   whose only purpose is to defeat a trial gate does not belong here.
+
+A recorded SDK behaviour from that work, worth keeping: **two live sender instances cannot share
+a source name.** Pre-warming a replacement before destroying the old one fails outright —
+`NDIlib_send_create_v2` returns NULL — so any such swap is necessarily destroy-then-create, with
+a real gap.
+
+### Surfacing it on screen
+
+Because the failure is completely silent on the sending side, it reads as a network problem to
+whoever is operating the phone. `ndi_jni.cpp` now watches the SDK's stdout for this message and
+calls back into `NdiSender.onNativeWarning`, which `MainActivity` renders as a red banner over
+the viewfinder.
+
+One JNI gotcha cost a debugging cycle here and is worth remembering: **`FindClass` does not work
+from a thread the JVM did not create.** The stdout pump is a plain `pthread`, and attaching it
+with `AttachCurrentThread` resolves classes against the bootstrap classloader, not the app's, so
+`FindClass("com/exmachina/ndicamerastreamer/NdiSender")` silently returned NULL and the banner
+never appeared. The class reference is now cached as a global ref in `nativeCreate`, which runs
+on a properly attached thread.
 
 ## Fixed: reconnect after Millumin disconnect stopped working
 

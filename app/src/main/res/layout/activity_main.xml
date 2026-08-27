@@ -22,6 +22,23 @@
         android:background="#80000000"
         android:text="Starting..." />
 
+    <!-- Hidden unless the NDI Advanced SDK's trial-license message is seen on its stdout (see
+         NdiSender.warningListener) — makes an otherwise-silent "stream stopped reaching
+         receivers" failure legible as a licensing issue instead of looking like a network
+         problem. -->
+    <TextView
+        android:id="@+id/trialWarningBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:padding="10dp"
+        android:textColor="#FFFFFF"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:gravity="center"
+        android:background="#DDAA0000"
+        android:visibility="gone" />
+
     <!-- Focus mode: upper-right, away from the lower half where tap-to-focus is most likely
          to be aimed. -->
     <Button

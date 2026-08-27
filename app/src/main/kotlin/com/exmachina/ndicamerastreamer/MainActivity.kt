@@ -43,6 +43,7 @@ private const val VIEWFINDER_HEIGHT = 450
 class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private lateinit var statusText: TextView
+    private lateinit var trialWarningBanner: TextView
     private lateinit var previewView: AspectRatioSurfaceView
     private lateinit var surfaceHolder: SurfaceHolder
     private lateinit var focusModeButton: Button
@@ -76,6 +77,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         setContentView(R.layout.activity_main)
 
         statusText = findViewById(R.id.statusText)
+        trialWarningBanner = findViewById(R.id.trialWarningBanner)
+        // Fires when the NDI Advanced SDK's own stdout reports its trial/license limit (see
+        // NdiSender.kt / ndi_jni.cpp) — without this, that failure is silent on our side (our
+        // sends keep "succeeding") and looks indistinguishable from a network problem to
+        // whoever's operating the phone.
+        NdiSender.warningListener = { _ ->
+            runOnUiThread {
+                trialWarningBanner.text = "⚠ NDI TRIAL LIMIT REACHED — receivers will get no " +
+                    "video until the app is restarted. Restarting is enough; no reboot needed."
+                trialWarningBanner.visibility = View.VISIBLE
+            }
+        }
         previewView = findViewById(R.id.surfaceView)
         previewView.aspectRatio = WIDTH.toFloat() / HEIGHT
         surfaceHolder = previewView.holder
