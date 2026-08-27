@@ -174,7 +174,7 @@ this API 26 device they are inert; the vendor keys cover older hardware but are 
 than branching on `Build.HARDWARE`, since unrecognised keys are ignored and SoC detection is
 what silently breaks on the next device. On API 31+ the codec is asked which it supports.
 
-## The SDK trial limit: measured at 5 minutes, not the 30 the message claims
+## The SDK trial limit: 5 minutes on mobile, documented (not just measured)
 
 The Advanced SDK's development license silently stops delivering a stream to receivers. The
 sender's own encode/send loop keeps reporting healthy throughput the entire time (confirmed
@@ -187,8 +187,18 @@ This version of the NDI Advanced SDK is designed for development use and will ru
 for 30 minutes. For a commercial use license, please email licensing@ndi.video.
 ```
 
-**The message says 30 minutes. Measured on this device, it is exactly 5.** Established by direct
-measurement, not inference:
+**The message says 30 minutes, but that string doesn't distinguish platforms.** The real number
+is documented, separately from the SDK bundle itself, on NDI's own site
+([docs.ndi.video/all/developing-with-ndi/sdk/licensing](https://docs.ndi.video/all/developing-with-ndi/sdk/licensing)):
+
+> Advanced SDK trials on Android, iOS, tvOS, and visionOS have a 5-minute runtime limit. The
+> standard 30-minute trial timeout applies to supported non-mobile platforms.
+
+This wasn't found by reading docs first — the SDK bundle's own PDFs and license agreement don't
+mention a mobile-specific number anywhere (checked directly: every PDF in
+`documentation/`, the license agreement, and the public NDI-Docs mirror). It was found by
+measuring the actual on-device behaviour, which matched the documented number exactly once it
+was located:
 
 | Observation | Evidence |
 | --- | --- |
@@ -198,7 +208,8 @@ measurement, not inference:
 | Coincides with real stream death | On-screen banner, Millumin failure, and an independent test receiver getting 0 frames in 20s — all together |
 | Reset by an app restart alone | Confirmed: restart (no reboot), Millumin reconnects immediately |
 
-Ruled out as explanations for the 6x discrepancy:
+Before finding the doc above, two other explanations for the 6x discrepancy were ruled out —
+kept here because they're real findings independent of what caused the gap:
 - **Our timestamps.** The obvious suspect, since the SDK could derive stream duration from the
   `pts`/`timecode` we supply. `CameraCapture` converts with `presentationTimeUs * 10L`, the
   correct microseconds -> 100ns conversion, so our PTS tracks real time 1:1.
@@ -206,11 +217,10 @@ Ruled out as explanations for the 6x discrepancy:
   holds ~2.3 Mbps no matter what target it is given (12 Mbps requested, ~2.3 Mbps produced), so
   bitrate cannot be used to vary volume, and the cutoff did not move.
 
-Best supported conclusion: the "30 minutes" text is generic boilerplate shared across the SDK,
-and the limit actually enforced on this build's NDI|HX compressed-send path is **5 minutes of
-wall-clock time per sender instance**. The sub-second precision across runs and the complete
-independence from uptime both point to a plain hard-coded timer started at instance creation
-rather than a budget of frames, bytes, or stream time.
+It's exactly what the measurement said: **5 minutes of wall-clock time per sender instance**,
+matching the doc's platform list (Android included) and matching four measured runs to within
+0.7s. Anchored at `NDIlib_send_create_v2`, independent of system uptime and of when a receiver
+connects — consistent with a plain timer started at instance creation.
 
 **The fix is a commercial NDI vendor license** (`licensing@ndi.video`), which is needed for any
 real use of this SDK anyway.
