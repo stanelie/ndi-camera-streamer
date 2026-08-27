@@ -83,6 +83,31 @@ tap is ignored while the previous sweep is still converging (it would otherwise 
 in-flight attempt, so focus could appear never to lock). A 4s timeout keeps the control from
 sticking if the HAL never reports a final AF state.
 
+## Staying alive
+
+A foreground service (`StreamingService`) keeps the stream running when the app is not in front.
+Without it Android treats a backgrounded camera app as disposable and reclaims it — on a phone
+left running for the length of a show, that means the feed vanishing unannounced.
+
+Verified on the S7:
+
+| Action | Result |
+| --- | --- |
+| Back | minimises (`moveTaskToBack`), keeps streaming |
+| Home | keeps streaming, process alive |
+| Screen off | keeps streaming |
+| Swipe away in the task switcher | stops |
+
+That last row is deliberate. `START_STICKY` gets the service restarted if the *system* kills it
+under memory pressure, while `android:stopWithTask="true"` lets the *operator* stop it on
+purpose. The aim is to survive accidents, not to be impossible to shut down.
+
+Note the camera is owned by the Activity, not the service, which is fine on the target device
+(API 26) and matches EpocCam-streamer. Android 9+ blocks background camera access for apps
+without a camera-typed foreground service; the service is declared
+`foregroundServiceType="camera"` for that reason, but if this is ever run on a newer device and
+the feed stops on backgrounding, moving capture into the service is the fix.
+
 ## Latency
 
 Glass-to-glass measured in Millumin, on a Galaxy S7 (Exynos, API 26).

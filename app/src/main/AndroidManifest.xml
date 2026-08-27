@@ -9,6 +9,12 @@
     <!-- Required for MulticastLock — NDI discovery is mDNS-SD under the hood. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
+    <!-- Foreground service: keeps the stream alive when the app is not in front. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <uses-feature android:name="android.hardware.camera2" android:required="true" />
 
     <application
@@ -29,6 +35,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- stopWithTask: swiping the app away in the task switcher stops the stream. That is
+             the deliberate operator gesture; everything short of it (Back, Home, screen-off,
+             memory pressure) should leave the stream running. -->
+        <service
+            android:name=".StreamingService"
+            android:foregroundServiceType="camera"
+            android:stopWithTask="true"
+            android:exported="false" />
 
     </application>
 

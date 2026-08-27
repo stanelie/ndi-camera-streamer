@@ -2,6 +2,7 @@ package com.exmachina.ndicamerastreamer
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Bundle
@@ -91,7 +92,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             else false
         }
 
-        val missingPerms = listOf(Manifest.permission.CAMERA)
+        val needed = mutableListOf(Manifest.permission.CAMERA)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            needed += Manifest.permission.POST_NOTIFICATIONS
+        }
+        val missingPerms = needed
             .filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
         if (missingPerms.isNotEmpty()) {
             ActivityCompat.requestPermissions(this, missingPerms.toTypedArray(), 1)
@@ -146,6 +151,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             it.acquire()
         }
 
+        // Foreground service first: it is what keeps the stream alive once the app is no longer
+        // in front, and Android requires it to be running before we rely on that.
+        startForegroundService(Intent(this, StreamingService::class.java))
+
         val deviceLabel = android.os.Build.MODEL ?: "Android"
         if (!ndiSender.start("$deviceLabel (NDI Camera Test)")) {
             statusText.text = "NDI init failed — see logcat"
@@ -166,6 +175,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun stopCapture() {
+        stopService(Intent(this, StreamingService::class.java))
         val c = capture; capture = null
         c?.stop()
         ndiSender.stop()
