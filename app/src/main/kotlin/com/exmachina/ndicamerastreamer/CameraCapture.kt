@@ -2,7 +2,12 @@ package com.exmachina.ndicamerastreamer
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.ImageFormat
+import android.hardware.HardwareBuffer
 import android.hardware.camera2.*
+import android.media.Image
+import android.media.ImageReader
+import android.media.ImageWriter
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -26,6 +31,19 @@ private const val TAG = "CameraCapture"
 private const val PREVIEW_STREAM_WIDTH = 640
 
 /**
+ * True on Qualcomm-based devices, which need the ImageReader/ImageWriter capture path — see
+ * [EncoderStream.captureSurface]. `Build.SOC_MANUFACTURER` is API 31+, so it is only consulted
+ * where it exists; `Build.HARDWARE` ("qcom") covers older devices.
+ */
+private val IS_QUALCOMM: Boolean by lazy {
+    val soc = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S)
+        android.os.Build.SOC_MANUFACTURER else ""
+    android.os.Build.HARDWARE.startsWith("qcom", ignoreCase = true) ||
+        soc.equals("QTI", ignoreCase = true) ||
+        soc.contains("Qualcomm", ignoreCase = true)
+}
+
+/**
  * Captures camera frames via Camera2, hardware-encodes them to H.264 via MediaCodec, and hands
  * each encoded access unit to [NdiSender] as NDI|HX — no software video compression anywhere
  * in this app. That split (hardware encode, NDI just tunnels the bytes) is the whole point of
@@ -37,12 +55,12 @@ private const val PREVIEW_STREAM_WIDTH = 640
  * fed by the same capture session, so the camera fans out to three surfaces: the on-screen
  * preview plus the two encoder input surfaces.
  *
- * The CaptureRequest tuning and MediaCodec settings below (ZSL off, CBR + KEY_LATENCY hint,
- * TEMPLATE_RECORD, direct camera→encoder Surface) mirror techniques EpocCam-streamer found
- * necessary on this camera hardware — written fresh for this pipeline, not copied. The direct
- * Surface path (no ImageReader/ImageWriter indirection) is deliberate: that workaround exists
- * for a Qualcomm HAL quirk and actively breaks Samsung/Exynos hardware, which is what this
- * phone (SM-G930W8, Exynos "hero" family) is.
+ * The CaptureRequest tuning and MediaCodec settings below (ZSL off, CBR, TEMPLATE_RECORD) mirror
+ * techniques EpocCam-streamer found necessary on this camera hardware — written fresh for this
+ * pipeline, not copied. Camera output routing is Qualcomm-gated: this phone (SM-G930W8, Exynos
+ * "hero" family) targets the encoder's input Surface directly, while Qualcomm devices (e.g. the
+ * Pixel 5) route through ImageReader/ImageWriter — see [IS_QUALCOMM] and
+ * [EncoderStream.captureSurface] for why.
  */
 class CameraCapture(
     private val context: Context,
@@ -164,7 +182,7 @@ class CameraCapture(
         if (dropScreenPreview.get()) null else previewHolder?.surface
 
     private fun currentEncoderSurfaces(): List<Surface> =
-        if (::streams.isInitialized) streams.mapNotNull { it.inputSurface } else emptyList()
+        if (::streams.isInitialized) streams.mapNotNull { it.captureSurface } else emptyList()
 
     private fun startCaptureSession(camera: CameraDevice) {
         val preview = currentPreviewSurface()
@@ -335,7 +353,16 @@ class CameraCapture(
         val isPreview: Boolean
     ) {
         private var codec: MediaCodec? = null
-        var inputSurface: Surface? = null
+        private var inputSurface: Surface? = null
+
+        // On API 29+ Qualcomm devices the camera targets an ImageReader and frames are forwarded
+        // to the encoder; everywhere else it targets the encoder's input Surface directly. See
+        // create() for why.
+        private var imageReader: ImageReader? = null
+        private var imageWriter: ImageWriter? = null
+
+        /** The surface the *camera* should target for this stream. */
+        var captureSurface: Surface? = null
             private set
 
         // Accumulated SPS+PPS (Annex-B, 4-byte start codes), refreshed whenever the encoder emits
@@ -379,9 +406,53 @@ class CameraCapture(
             val enc = MediaCodec.createEncoderByType("video/avc")
             applyLowLatencyHints(format, enc, label)
             enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            inputSurface = enc.createInputSurface()
+            val encSurface = enc.createInputSurface()
+            inputSurface = encSurface
             enc.start()
             codec = enc
+
+            // Feeding the camera straight into MediaCodec.createInputSurface() is the documented
+            // zero-copy path, but on Qualcomm devices (confirmed on a Pixel 5, and see
+            // https://issuetracker.google.com/issues/254027327 — closed "Won't Fix (Obsolete)"
+            // by Google with no platform fix) that surface's USAGE_VIDEO_ENCODE HardwareBuffer
+            // flag puts the driver into a mode that holds ~1s of frames, regardless of any
+            // MediaCodec or CaptureRequest tuning. Routing through ImageReader -> ImageWriter
+            // avoids the flag while staying a zero-copy GPU handoff.
+            //
+            // Qualcomm-gated on purpose: this path actively breaks other vendors — on Exynos it
+            // encodes solid green frames while the phone's own viewfinder stays correct, so a
+            // version-only gate would break the S7 this app primarily targets.
+            captureSurface = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q && IS_QUALCOMM) {
+                try {
+                    val writer = ImageWriter.newInstance(encSurface, 2, ImageFormat.PRIVATE)
+                    val reader = ImageReader.newInstance(
+                        width, height, ImageFormat.PRIVATE, 2, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
+                    )
+                    reader.setOnImageAvailableListener({ r ->
+                        val image: Image = try {
+                            r.acquireLatestImage()
+                        } catch (e: Exception) {
+                            Log.w(TAG, "[$label] acquireLatestImage failed: $e"); null
+                        } ?: return@setOnImageAvailableListener
+                        try {
+                            writer.queueInputImage(image)  // takes ownership of image on success
+                        } catch (e: Exception) {
+                            Log.w(TAG, "[$label] queueInputImage failed: $e")
+                            image.close()
+                        }
+                    }, cameraHandler)
+                    imageWriter = writer
+                    imageReader = reader
+                    Log.i(TAG, "[$label] Qualcomm: camera -> ImageReader -> encoder (latency workaround)")
+                    reader.surface
+                } catch (e: Exception) {
+                    Log.w(TAG, "[$label] ImageReader path setup failed, using direct Surface: $e")
+                    encSurface
+                }
+            } else {
+                Log.i(TAG, "[$label] camera -> encoder Surface directly")
+                encSurface
+            }
         }
 
         fun requestSyncFrame() {
@@ -509,6 +580,11 @@ class CameraCapture(
         }
 
         fun release() {
+            captureSurface = null
+            try { imageReader?.close() } catch (_: Exception) {}
+            imageReader = null
+            try { imageWriter?.close() } catch (_: Exception) {}
+            imageWriter = null
             inputSurface?.release(); inputSurface = null
             try { codec?.stop() } catch (_: Exception) {}
             try { codec?.release() } catch (_: Exception) {}
