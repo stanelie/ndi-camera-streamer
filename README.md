@@ -174,6 +174,32 @@ this API 26 device they are inert; the vendor keys cover older hardware but are 
 than branching on `Build.HARDWARE`, since unrecognised keys are ignored and SoC detection is
 what silently breaks on the next device. On API 31+ the codec is asked which it supports.
 
+## Dropped the preview stream: real thermal/CPU win, no functional loss
+
+The NDI|HX docs describe publishing two streams — the full-bandwidth "program" stream and a
+640-wide "preview" stream — and this app did that for a while. In hindsight that was added as a
+*hypothesis* partway through the "video decoder not found" investigation, before the real cause
+(missing Annex-B start codes, see above) was found. It never actually fixed anything, but stayed
+in the code afterward without being re-tested in isolation.
+
+Prompted by the phone running hot, it was re-tested: single-stream raises no complaint on NDI's
+own stream-validation stdout, and decodes cleanly in both this SDK's own receiver tooling and
+Millumin. Measured on the S7 (`/proc/<pid>/stat` sampling, 5s window):
+
+| Process | Two streams | One stream |
+| --- | --- | --- |
+| `media.codec` (encoder driver overhead) | ~29% | ~17.6% |
+| This app | ~37% | ~34% |
+| `cameraserver` (ISP) | ~47% | ~47% (unchanged — the surviving 800x450 viewfinder stream is nearly as much ISP work as the removed preview stream was) |
+
+Camera surface count also dropped from 3 to 2 (viewfinder + program), which matters separately:
+Camera2 only strictly guarantees 2 concurrent outputs at LIMITED hardware level, so this is also
+a robustness improvement, not just a thermal one.
+
+If some other receiver ever turns out to need the preview stream, `EncoderStream` in
+`CameraCapture.kt` still takes an `isPreview` flag — reintroducing it is adding a second instance
+back into the `streams` list in `start()`, not rebuilding the mechanism.
+
 ## Open: Millumin sometimes slow to connect
 
 Not yet reproduced on demand, so not yet diagnosed — recorded so the next occurrence has

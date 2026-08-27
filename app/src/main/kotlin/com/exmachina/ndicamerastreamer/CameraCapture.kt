@@ -11,7 +11,6 @@ import android.media.ImageWriter
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
-import android.media.MediaCodec as AndroidMediaCodec
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -24,11 +23,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 private const val TAG = "CameraCapture"
-
-// An NDI|HX source must publish two streams: the full-bandwidth "program" stream and a preview
-// stream that the SDK docs require to be 640 pixels wide with square pixels. Height follows the
-// program stream's aspect ratio (640x360 at 16:9).
-private const val PREVIEW_STREAM_WIDTH = 640
 
 /**
  * True on Qualcomm-based devices, which need the ImageReader/ImageWriter capture path — see
@@ -51,9 +45,19 @@ private val IS_QUALCOMM: Boolean by lazy {
  * (measured directly — see README), which MediaCodec's encoder ASIC does for essentially free,
  * the same way EpocCam-streamer gets its ~0.1s latency.
  *
- * Two encoders run concurrently, one per required NDI|HX stream (see [EncoderStream]). Both are
- * fed by the same capture session, so the camera fans out to three surfaces: the on-screen
- * preview plus the two encoder input surfaces.
+ * Sends a single H.264 stream (see [EncoderStream]), fed by the same capture session as the
+ * on-screen viewfinder — two camera outputs total.
+ *
+ * NDI|HX's own docs describe publishing a second, 640-wide "preview" stream alongside the
+ * full-bandwidth one, and this app did that for a while — added as a hypothesis while chasing
+ * the "video decoder not found" investigation (see README), before the real cause (missing
+ * Annex-B start codes) was found. Once fixed, the preview stream was re-tested in isolation and
+ * confirmed unnecessary: NDI's own stream-validation stdout raises no complaint about a missing
+ * preview stream, and receivers (this SDK's own tooling, and Millumin) decode the program stream
+ * fine without one. Removing it is a real, measured win on this hardware — one fewer concurrent
+ * MediaCodec session cut `media.codec` process CPU by roughly 40% (29% -> 17.6%, sampled via
+ * `/proc/<pid>/stat`). If a future receiver turns out to need the preview stream after all,
+ * [EncoderStream] still takes an `isPreview` flag — reintroduce a second instance in `start()`.
  *
  * The CaptureRequest tuning and MediaCodec settings below (ZSL off, CBR, TEMPLATE_RECORD) mirror
  * techniques EpocCam-streamer found necessary on this camera hardware — written fresh for this
@@ -76,10 +80,10 @@ class CameraCapture(
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
 
-    // Set once the HAL refuses screen-preview + both encoders together (3 concurrent camera
-    // outputs is beyond what Camera2 guarantees at LIMITED/FULL level, and this phone rejects
-    // it). The two NDI streams are the point of the app, so the on-screen preview is what gets
-    // dropped; startCaptureSession then retries with encoders only.
+    // Set if the HAL ever refuses screen-preview + encoder together. Camera2 only strictly
+    // guarantees 2 concurrent outputs at LIMITED level, so even this reduced 2-surface set
+    // (down from 3 when a second encoder stream was in the mix) is not universally guaranteed;
+    // the NDI stream is the point of the app, so the on-screen preview is what gets dropped.
     private val dropScreenPreview = AtomicBoolean(false)
 
     // Autofocus mode currently programmed into the repeating request. CONTINUOUS_VIDEO lets the
@@ -100,39 +104,7 @@ class CameraCapture(
     private val cameraThread = HandlerThread("ndi-camera").also { it.start() }
     private val cameraHandler = Handler(cameraThread.looper)
 
-    // Built in start(), once the camera's actually-supported output sizes are known — the
-    // HX-spec 640x360 preview size is not universally available (this Exynos HAL rejects it
-    // outright: "Invalid preview size(640x360)"), so the size is negotiated, not assumed.
     private lateinit var streams: List<EncoderStream>
-
-    /**
-     * Picks the preview-stream size: the smallest camera-supported size that matches the program
-     * stream's aspect ratio and is at least [PREVIEW_STREAM_WIDTH] wide. The HX docs ask for 640
-     * wide with square pixels; where the camera cannot produce exactly that, the nearest larger
-     * matching size is the closest we can get while keeping the aspect ratio correct (a
-     * different aspect ratio would distort the preview stream relative to the program stream).
-     */
-    private fun choosePreviewSize(characteristics: CameraCharacteristics): Pair<Int, Int> {
-        val targetAspect = width.toDouble() / height
-        val supported = characteristics
-            .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            ?.getOutputSizes(AndroidMediaCodec::class.java)
-            ?.toList()
-            .orEmpty()
-        val sameAspect = supported.filter {
-            kotlin.math.abs(it.width.toDouble() / it.height - targetAspect) < 0.02
-        }
-        val pick = sameAspect.filter { it.width >= PREVIEW_STREAM_WIDTH }.minByOrNull { it.width }
-            ?: sameAspect.maxByOrNull { it.width }
-        if (pick == null) {
-            Log.w(TAG, "no aspect-matching preview size; falling back to program size")
-            return width to height
-        }
-        if (pick.width != PREVIEW_STREAM_WIDTH) {
-            Log.w(TAG, "camera cannot output ${PREVIEW_STREAM_WIDTH}-wide preview; using ${pick.width}x${pick.height}")
-        }
-        return pick.width to pick.height
-    }
 
     @SuppressLint("MissingPermission")
     fun start() {
@@ -145,18 +117,9 @@ class CameraCapture(
                 .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
         } ?: manager.cameraIdList[0]
 
-        val (pw, ph) = choosePreviewSize(manager.getCameraCharacteristics(cameraId))
         streams = listOf(
-            EncoderStream("program", width, height, bitrate, isPreview = false),
-            EncoderStream(
-                "preview", pw, ph,
-                // Bitrate scaled by pixel count relative to the program stream.
-                (bitrate.toLong() * pw * ph / (width.toLong() * height))
-                    .toInt().coerceAtLeast(300_000),
-                isPreview = true
-            )
+            EncoderStream("program", width, height, bitrate, isPreview = false)
         )
-        Log.i(TAG, "streams: program=${width}x${height}@${bitrate} preview=${pw}x${ph}@${streams[1].bitrate}")
 
         streams.forEach { it.create() }
         streams.forEach { it.drainThread.start() }
@@ -261,7 +224,7 @@ class CameraCapture(
         while (running.get()) {
             ndiSender.waitForKeyframeRequest(50)  // wakes as soon as the requirement changes
             if (!running.get()) break
-            if (ndiSender.isKeyframeRequired()) streams.forEach { it.requestSyncFrame() }  // both streams
+            if (ndiSender.isKeyframeRequired()) streams.forEach { it.requestSyncFrame() }
         }
     }, "ndi-keyframe")
 
