@@ -16,6 +16,7 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 private const val TAG = "CameraCapture"
 
@@ -62,6 +63,21 @@ class CameraCapture(
     // it). The two NDI streams are the point of the app, so the on-screen preview is what gets
     // dropped; startCaptureSession then retries with encoders only.
     private val dropScreenPreview = AtomicBoolean(false)
+
+    // Autofocus mode currently programmed into the repeating request. CONTINUOUS_VIDEO lets the
+    // HAL refocus on its own; AUTO is used for tap-to-focus, where the lens is driven once and
+    // then stays put (the "manual" mode from the operator's point of view).
+    @Volatile private var afMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+    private val afStateListener = AtomicReference<((Int) -> Unit)?>(null)
+
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult
+        ) {
+            val state = result.get(CaptureResult.CONTROL_AF_STATE) ?: return
+            afStateListener.get()?.invoke(state)
+        }
+    }
 
     private val cameraThread = HandlerThread("ndi-camera").also { it.start() }
     private val cameraHandler = Handler(cameraThread.looper)
@@ -144,9 +160,15 @@ class CameraCapture(
         }, cameraHandler)
     }
 
+    private fun currentPreviewSurface(): Surface? =
+        if (dropScreenPreview.get()) null else previewHolder?.surface
+
+    private fun currentEncoderSurfaces(): List<Surface> =
+        if (::streams.isInitialized) streams.mapNotNull { it.inputSurface } else emptyList()
+
     private fun startCaptureSession(camera: CameraDevice) {
-        val preview = if (dropScreenPreview.get()) null else previewHolder?.surface
-        val encoderSurfaces = if (::streams.isInitialized) streams.mapNotNull { it.inputSurface } else emptyList()
+        val preview = currentPreviewSurface()
+        val encoderSurfaces = currentEncoderSurfaces()
         val surfaces = listOfNotNull(preview) + encoderSurfaces
         try {
             camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
@@ -155,7 +177,8 @@ class CameraCapture(
                     captureSession = session
                     try {
                         session.setRepeatingRequest(
-                            buildRequest(camera, preview, encoderSurfaces), null, cameraHandler)
+                            buildRequest(camera, preview, encoderSurfaces, afMode),
+                            captureCallback, cameraHandler)
                     } catch (e: IllegalStateException) {
                         Log.w(TAG, "onConfigured: session superseded: $e")
                     }
@@ -176,14 +199,20 @@ class CameraCapture(
         }
     }
 
-    private fun buildRequest(camera: CameraDevice, preview: Surface?, encoders: List<Surface>) =
-        camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+    private fun buildRequest(
+        camera: CameraDevice,
+        preview: Surface?,
+        encoders: List<Surface>,
+        requestAfMode: Int,
+        afTrigger: Int = CaptureRequest.CONTROL_AF_TRIGGER_IDLE
+    ) = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
             preview?.let { addTarget(it) }
             encoders.forEach { addTarget(it) }
             set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps))
             set(CaptureRequest.CONTROL_ENABLE_ZSL, false)
-            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+            set(CaptureRequest.CONTROL_AF_MODE, requestAfMode)
+            set(CaptureRequest.CONTROL_AF_TRIGGER, afTrigger)
             set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
             set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
             set(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_OFF)
@@ -218,8 +247,74 @@ class CameraCapture(
         }
     }, "ndi-keyframe")
 
+    /** Hands focus back to the HAL's continuous autofocus. */
+    fun setContinuousAf() {
+        val cam = cameraDevice ?: return
+        val session = captureSession ?: return
+        afMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+        afStateListener.set(null)
+        val preview = currentPreviewSurface()
+        val encoders = currentEncoderSurfaces()
+        try {
+            // Cancel the outstanding trigger before resuming continuous AF. Simply setting
+            // CONTROL_AF_MODE back is not enough on this class of HAL — the lens stays parked at
+            // its locked position until the trigger is explicitly cancelled.
+            session.capture(
+                buildRequest(cam, preview, encoders,
+                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO,
+                    CaptureRequest.CONTROL_AF_TRIGGER_CANCEL),
+                null, cameraHandler)
+            session.setRepeatingRequest(
+                buildRequest(cam, preview, encoders, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO),
+                captureCallback, cameraHandler)
+        } catch (e: Exception) {
+            Log.e(TAG, "setContinuousAf failed: $e")
+        }
+    }
+
+    /**
+     * Runs one autofocus sweep and leaves the lens locked there. [onDone] reports whether the
+     * HAL considered the result in focus, and fires on the camera thread.
+     */
+    fun triggerAfAndLock(onDone: (focused: Boolean) -> Unit) {
+        val cam = cameraDevice ?: return
+        val session = captureSession ?: return
+        afMode = CaptureRequest.CONTROL_AF_MODE_AUTO
+        val preview = currentPreviewSurface()
+        val encoders = currentEncoderSurfaces()
+        try {
+            // Cancel any previous lock so the AF state machine restarts cleanly.
+            session.capture(
+                buildRequest(cam, preview, encoders, CaptureRequest.CONTROL_AF_MODE_AUTO,
+                    CaptureRequest.CONTROL_AF_TRIGGER_CANCEL),
+                null, cameraHandler)
+
+            var reported = false
+            afStateListener.set { state ->
+                if (!reported && (state == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                                  state == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED)) {
+                    reported = true
+                    afStateListener.set(null)
+                    onDone(state == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED)
+                }
+            }
+
+            session.capture(
+                buildRequest(cam, preview, encoders, CaptureRequest.CONTROL_AF_MODE_AUTO,
+                    CaptureRequest.CONTROL_AF_TRIGGER_START),
+                captureCallback, cameraHandler)
+            // Repeating in AUTO holds the lock and keeps AF state flowing to the listener.
+            session.setRepeatingRequest(
+                buildRequest(cam, preview, encoders, CaptureRequest.CONTROL_AF_MODE_AUTO),
+                captureCallback, cameraHandler)
+        } catch (e: Exception) {
+            Log.e(TAG, "triggerAfAndLock failed: $e")
+        }
+    }
+
     fun stop() {
         Log.i(TAG, "stop()")
+        afStateListener.set(null)
         running.set(false)
         captureSession?.close(); captureSession = null
         cameraDevice?.close(); cameraDevice = null

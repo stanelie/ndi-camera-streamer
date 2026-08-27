@@ -6,8 +6,11 @@ import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.util.Log
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.WindowManager
+import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -38,6 +41,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var statusText: TextView
     private lateinit var previewView: AspectRatioSurfaceView
     private lateinit var surfaceHolder: SurfaceHolder
+    private lateinit var focusModeButton: Button
+
+    // false = continuous autofocus (HAL refocuses on its own).
+    // true  = tap-to-focus: the lens is driven once and locked, and each tap re-locks.
+    private var tapFocusMode = false
+    // Guards against a second tap landing while the first is still converging — that would
+    // cancel the in-flight attempt, so focus could appear never to lock and the button label
+    // would flicker as attempts completed out of order.
+    @Volatile private var focusInProgress = false
+    private val focusTimeoutHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
     private val ndiSender = NdiSender()
     @Volatile private var capture: CameraCapture? = null
@@ -55,11 +68,52 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         surfaceHolder.setFixedSize(VIEWFINDER_WIDTH, VIEWFINDER_HEIGHT)
         surfaceHolder.addCallback(this)
 
+        focusModeButton = findViewById(R.id.focusModeButton)
+        focusModeButton.setOnClickListener {
+            tapFocusMode = !tapFocusMode
+            if (tapFocusMode) {
+                // Lock immediately rather than waiting for a separate tap; a later tap re-locks
+                // at that point through the same path.
+                triggerFocus()
+            } else {
+                // Cancel any in-flight attempt so its timeout cannot later overwrite this "AF"
+                // with a stale "MF?" — setContinuousAf() clears the camera-side listener, which
+                // would otherwise leave triggerAfAndLock's callback pending forever.
+                focusInProgress = false
+                focusTimeoutHandler.removeCallbacksAndMessages(null)
+                focusModeButton.text = "AF"
+                capture?.setContinuousAf()
+            }
+        }
+
+        findViewById<FrameLayout>(R.id.rootLayout).setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_DOWN && tapFocusMode) { triggerFocus(); true }
+            else false
+        }
+
         val missingPerms = listOf(Manifest.permission.CAMERA)
             .filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
         if (missingPerms.isNotEmpty()) {
             ActivityCompat.requestPermissions(this, missingPerms.toTypedArray(), 1)
         }
+    }
+
+    private fun triggerFocus() {
+        if (focusInProgress) return  // ignore a retap while the previous attempt converges
+        val c = capture ?: return
+        focusInProgress = true
+        focusModeButton.text = "..."
+        // Safety net: if the HAL never reports a final AF state, don't leave focus permanently
+        // stuck ignoring taps.
+        focusTimeoutHandler.postDelayed({ finishFocus(focused = false) }, 4_000L)
+        c.triggerAfAndLock { focused -> runOnUiThread { finishFocus(focused) } }
+    }
+
+    private fun finishFocus(focused: Boolean) {
+        if (!focusInProgress) return  // already finished (e.g. timeout fired after the callback)
+        focusInProgress = false
+        focusTimeoutHandler.removeCallbacksAndMessages(null)
+        focusModeButton.text = if (focused) "MF" else "MF?"
     }
 
     override fun onRequestPermissionsResult(req: Int, perms: Array<String>, results: IntArray) {

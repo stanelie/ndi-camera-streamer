@@ -67,6 +67,22 @@ Things that were investigated and are **not** the cause — recorded so they are
   failures on **stdout**, which Android discards. `redirectStdioToLogcat` in `ndi_jni.cpp` pipes
   it into logcat, which is how the I-frame timing violation below was found. Keep it.
 
+## Operator controls
+
+A focus-mode button sits top-right on the phone:
+
+- **AF** — continuous autofocus; the HAL refocuses on its own.
+- **MF** — tap-to-focus. Pressing the button runs one autofocus sweep and locks the lens there;
+  tapping anywhere on the preview re-locks at that moment. **MF?** means the sweep finished but
+  the HAL did not consider the result in focus. Pressing the button again returns to AF.
+
+Two behaviours are deliberate, both carried over from EpocCam-streamer where they were needed on
+this class of camera HAL: resuming continuous AF issues an explicit `CONTROL_AF_TRIGGER_CANCEL`
+first (merely setting the mode back leaves the lens parked at its locked position), and a second
+tap is ignored while the previous sweep is still converging (it would otherwise cancel the
+in-flight attempt, so focus could appear never to lock). A 4s timeout keeps the control from
+sticking if the HAL never reports a final AF state.
+
 ## Latency
 
 Glass-to-glass measured in Millumin, on a Galaxy S7 (Exynos, API 26).
