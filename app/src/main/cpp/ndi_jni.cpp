@@ -15,6 +15,8 @@
 #include <android/log.h>
 #include <atomic>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <pthread.h>
 #include <unistd.h>
 #include <vector>
@@ -28,20 +30,60 @@
 namespace {
 std::atomic<bool> g_ndiInitialized{false};
 
-// Async sending requires the frame's memory to stay valid until the *next* async call on this
-// sender, so neither a stack-allocated packet header nor a JNI array pointer (released on
-// return) can be used. Each send is assembled into one contiguous, persistently-owned buffer —
-// [compressed_packet_t][H.264 data][SPS/PPS] — exactly the layout the SDK's own non-scatter
-// example builds, which also lets us drop the scatter-gather list entirely. Three slots rotate
-// so a buffer is never rewritten while the SDK may still be reading it (two would satisfy the
-// documented rule; the third is margin).
+// Async sending requires the frame's memory to stay valid until the SDK is done with it — but
+// NOT necessarily just until "the next call": per the SDK's own docs (Asynchronous Sending
+// Completions), if a receiver has disconnected ungracefully, the SDK can hold a buffer until
+// that connection internally times out, which is far longer than a handful of frames. A fixed
+// small rotation (this app's original approach: 3 slots, reused blindly in order) can overwrite
+// a buffer NDI still references for a stale connection — memory corruption that plausibly
+// explains a real bug this exact mechanism produced: after a receiver disconnected, a *new*
+// connection attempt would get zero video frames indefinitely, while this app's own encode/send
+// loop kept reporting healthy throughput throughout (confirmed by direct reproduction).
+//
+// Fixed properly per the SDK's documented mechanism: a completion handler
+// (NDIlib_send_set_video_async_completion) tells us exactly when each buffer is actually free,
+// and the pool grows on demand instead of guessing a fixed slot count.
 struct SendSlot {
     std::vector<uint8_t> buf;
     NDIlib_video_frame_v2_t frame{};
+    std::atomic<bool> inUse{false};
 };
-constexpr int kSendSlots = 3;
-SendSlot g_slots[kSendSlots];
-int g_slotIdx = 0;
+std::mutex g_poolMutex;  // guards g_pool; touched both by the sender thread and the SDK's own
+                         // completion-callback thread, which the docs say can be either
+std::vector<std::unique_ptr<SendSlot>> g_pool;
+
+// Called by the SDK (on its own thread — must stay quick and not lock permanently, per the
+// docs) once a submitted frame's buffer is no longer needed by any connection, including
+// stalled/disconnecting ones. Matches by pointer identity against the pool.
+void onAsyncSendComplete(void* /*p_opaque*/, const NDIlib_video_frame_v2_t* p_video_data) {
+    if (p_video_data == nullptr || p_video_data->p_data == nullptr) return;
+    std::lock_guard<std::mutex> lock(g_poolMutex);
+    for (auto& slot : g_pool) {
+        if (slot->buf.data() == p_video_data->p_data) {
+            slot->inUse.store(false);
+            return;
+        }
+    }
+}
+
+// Returns a slot guaranteed not in use by the SDK (grows the pool if every existing slot is
+// still claimed — e.g. several stalled/slow connections at once). No hard cap: at steady state
+// with one healthy connection this settles to ~2 slots, and even a pathological case sized in
+// the dozens is negligible memory next to one encoded frame's already-small footprint.
+SendSlot* claimSlot() {
+    std::lock_guard<std::mutex> lock(g_poolMutex);
+    for (auto& slot : g_pool) {
+        bool expected = false;
+        if (slot->inUse.compare_exchange_strong(expected, true)) return slot.get();
+    }
+    g_pool.push_back(std::make_unique<SendSlot>());
+    g_pool.back()->inUse.store(true);
+    if (g_pool.size() > 8) {
+        LOGE("send buffer pool grew to %zu — a receiver may be stalled/not disconnecting cleanly",
+             g_pool.size());
+    }
+    return g_pool.back().get();
+}
 
 // The NDI HX SDK reports stream-validation failures by printing to STDOUT (and says it will
 // terminate an invalid stream). Android sends a native process's stdout/stderr to /dev/null,
@@ -108,6 +150,12 @@ Java_com_exmachina_ndicamerastreamer_NdiSender_nativeCreate(
         LOGE("NDIlib_send_create_v2 failed");
         return 0;
     }
+
+    // Own buffer-lifetime tracking (see SendSlot above) instead of the SDK's default "safe until
+    // the next async call" assumption, which the docs say does not hold for stalled/ungracefully
+    // disconnected receivers.
+    NDIlib_send_set_video_async_completion(instance, nullptr, onAsyncSendComplete);
+
     LOGI("NDI|HX sender created");
     return reinterpret_cast<jlong>(instance);
 }
@@ -144,21 +192,21 @@ Java_com_exmachina_ndicamerastreamer_NdiSender_nativeSendCompressedFrame(
     packet.data_size = static_cast<uint32_t>(frameSize);
     packet.extra_data_size = static_cast<uint32_t>(extraSize);
 
-    // Assemble into a rotating persistent slot (see SendSlot above). Callers are serialized by
-    // NdiSender.sendCompressedFrame, so the rotation needs no extra locking.
-    SendSlot& slot = g_slots[g_slotIdx];
-    g_slotIdx = (g_slotIdx + 1) % kSendSlots;
+    // A slot the completion callback has confirmed free (see SendSlot/claimSlot above) — not a
+    // blind rotation, since the SDK can legitimately hold a buffer well past a few frames' worth
+    // of turnover if a receiver is stalled or disconnecting ungracefully.
+    SendSlot* slot = claimSlot();
 
     const size_t total = sizeof(packet) + static_cast<size_t>(frameSize) + static_cast<size_t>(extraSize);
-    slot.buf.resize(total);
-    uint8_t* dst = slot.buf.data();
+    slot->buf.resize(total);
+    uint8_t* dst = slot->buf.data();
     memcpy(dst, &packet, sizeof(packet));
     memcpy(dst + sizeof(packet), reinterpret_cast<const uint8_t*>(frameBytes) + frameOffset, frameSize);
     if (extraBytes != nullptr && extraSize > 0) {
         memcpy(dst + sizeof(packet) + frameSize, extraBytes, extraSize);
     }
 
-    NDIlib_video_frame_v2_t& videoFrame = slot.frame;
+    NDIlib_video_frame_v2_t& videoFrame = slot->frame;
     videoFrame = NDIlib_video_frame_v2_t{};
     videoFrame.xres = width;
     videoFrame.yres = height;

@@ -174,6 +174,33 @@ this API 26 device they are inert; the vendor keys cover older hardware but are 
 than branching on `Build.HARDWARE`, since unrecognised keys are ignored and SoC detection is
 what silently breaks on the next device. On API 31+ the codec is asked which it supports.
 
+## Fixed: reconnect after Millumin disconnect stopped working
+
+After running for a while, disconnecting Millumin and trying to reconnect would fail: the phone
+kept encoding and sending frames normally (steady heartbeat in logcat, no errors), but a *new*
+receiver connection got nothing — the exact same symptom as an earlier internal bug during
+testing (see the git history around v0.1/v0.2), just now triggered by a normal Millumin
+disconnect rather than repeatedly force-killing test tools.
+
+Root cause: async sending. `NDIlib_send_send_video_async_v2` hands the SDK a pointer and returns
+immediately; that buffer must stay valid until the SDK is done with it. This app assumed "done"
+meant "after 3 more frames go out" and blindly rotated through 3 fixed buffers. The SDK's own
+docs on asynchronous sending completions say otherwise: *"if a connection is stalled and holds
+onto a buffer until the connection times-out"* — which is exactly what an ungracefully
+disconnected receiver (closing the app, a dropped connection) looks like — the buffer can be held
+far longer than a few frames' worth of rotation. The blind rotation could overwrite a buffer NDI
+still referenced for that stale connection, corrupting what got sent and plausibly explaining why
+new connections received nothing afterward.
+
+Fixed per the SDK's documented mechanism: `NDIlib_send_set_video_async_completion` registers a
+callback that fires exactly when each buffer is actually free. The fixed 3-slot array is now a
+pool that grows on demand and only reuses a buffer once the SDK has confirmed it through that
+callback — see `ndi_jni.cpp`.
+
+Verified: sender stays healthy (steady encode/send throughput, no stalls) through repeated
+connect/ungraceful-disconnect cycles, and reconnecting in Millumin after a real disconnect is
+fast again.
+
 ## Dropped the preview stream: real thermal/CPU win, no functional loss
 
 The NDI|HX docs describe publishing two streams — the full-bandwidth "program" stream and a
