@@ -85,7 +85,7 @@ void redirectStdioToLogcat() {
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_exmachina_ndicamerastreamer_NdiSender_nativeCreate(
-        JNIEnv* env, jobject /*thiz*/, jstring jSourceName) {
+        JNIEnv* env, jobject /*thiz*/, jstring jSourceName, jstring jConfigJson) {
     if (!g_ndiInitialized.exchange(true)) {
         redirectStdioToLogcat();   // before NDIlib_initialize, so we catch its output too
         if (!NDIlib_initialize()) {
@@ -109,10 +109,21 @@ Java_com_exmachina_ndicamerastreamer_NdiSender_nativeCreate(
     createSettings.clock_video = false;
     createSettings.clock_audio = false;
 
-    // v2 + null config data == default Advanced SDK settings; a vendor id would normally go
-    // in p_config_data for a shipped product, not needed for local testing.
-    NDIlib_send_instance_t instance = NDIlib_send_create_v2(&createSettings, nullptr);
+    // p_config_data overrides the "machine name" half of the advertised source name
+    // (MACHINE_NAME (SOURCE_NAME)). Android has no real network hostname — gethostname()
+    // returns the literal string "localhost" on every device — so without this override every
+    // Android sender on the LAN advertises itself as "LOCALHOST (...)". Per NDI's own docs, a
+    // machine-name clash "is incompatible with mDNS and can cause all other sources not to work
+    // correctly"; this matched a real symptom (source discovered instantly, but no video
+    // frames arriving for tens of seconds) that a plain hostname of "localhost" plausibly
+    // explains, since some mDNS resolvers special-case "localhost" as always-loopback and won't
+    // resolve it over multicast at all. See NdiSender.kt for where the unique per-device name
+    // comes from.
+    const char* configJson = jConfigJson ? env->GetStringUTFChars(jConfigJson, nullptr) : nullptr;
+
+    NDIlib_send_instance_t instance = NDIlib_send_create_v2(&createSettings, configJson);
     env->ReleaseStringUTFChars(jSourceName, sourceName);
+    if (configJson) env->ReleaseStringUTFChars(jConfigJson, configJson);
 
     if (!instance) {
         LOGE("NDIlib_send_create_v2 failed");

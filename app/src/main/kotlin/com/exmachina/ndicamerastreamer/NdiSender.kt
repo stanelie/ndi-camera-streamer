@@ -15,7 +15,7 @@ private const val TAG = "NdiSender"
 // the cutoff is never actually reached during normal operation. A commercial NDI vendor license
 // (licensing@ndi.video) would remove the limit outright; this is the workaround until/unless
 // that happens.
-private const val PROACTIVE_RESTART_INTERVAL_MS = 25 * 60 * 1000L  // 25 min — 5 min margin under the SDK's 30-min limit
+private const val PROACTIVE_RESTART_INTERVAL_MS = 28 * 60 * 1000L  // 28 min — tighter margin, chosen to minimize how many times a show is exposed to the swap's confirmed unpredictable reconnect gap
 
 /**
  * Kotlin face of the JNI bridge in app/src/main/cpp/ndi_jni.cpp, which wraps libndi_advanced.so
@@ -33,7 +33,7 @@ private const val PROACTIVE_RESTART_INTERVAL_MS = 25 * 60 * 1000L  // 25 min —
  */
 class NdiSender {
 
-    private external fun nativeCreate(sourceName: String): Long
+    private external fun nativeCreate(sourceName: String, configJson: String?): Long
     private external fun nativeSendCompressedFrame(
         ptr: Long, width: Int, height: Int, fpsN: Int, fpsD: Int,
         isPreview: Boolean, isKeyframe: Boolean, ptsHns: Long,
@@ -46,21 +46,37 @@ class NdiSender {
 
     @Volatile private var instancePtr: Long = 0
     @Volatile private var sourceName: String = ""
+    @Volatile private var configJson: String? = null
     @Volatile private var running = false
     private var restartThread: Thread? = null
 
+    /**
+     * [machineName] overrides the "machine name" half of the advertised source name
+     * (MACHINE_NAME (SOURCE_NAME)) via the Advanced SDK's per-instance JSON config. Required on
+     * Android: gethostname() always returns the literal "localhost" here (there is no real
+     * network hostname), which the NDI docs explicitly warn causes machine-name clashes on the
+     * network — "incompatible with mDNS and can cause all other sources not to work correctly."
+     * Confirmed directly: this device's NDI source browsed as "LOCALHOST (SM-G930W8 (NDI Camera
+     * Test))", and a receiver could discover it instantly yet get zero video frames for up to
+     * ~60s — consistent with mDNS resolvers that special-case "localhost" as always-loopback and
+     * refuse to resolve it over multicast. Caller must pass something unique per physical device
+     * (see MainActivity, which derives it from ANDROID_ID) — a duplicate machine name elsewhere
+     * on the network reproduces the same class of bug this works around.
+     */
     @Synchronized
-    fun start(sourceName: String): Boolean {
-        val ptr = nativeCreate(sourceName)
+    fun start(sourceName: String, machineName: String): Boolean {
+        val json = """{"ndi":{"machinename":"$machineName"}}"""
+        val ptr = nativeCreate(sourceName, json)
         if (ptr == 0L) {
             Log.e(TAG, "nativeCreate failed for '$sourceName'")
             return false
         }
         instancePtr = ptr
         this.sourceName = sourceName
+        this.configJson = json
         running = true
         scheduleProactiveRestart()
-        Log.i(TAG, "NDI|HX source '$sourceName' started")
+        Log.i(TAG, "NDI|HX source '$sourceName' started (machine name '$machineName')")
         return true
     }
 
@@ -91,9 +107,11 @@ class NdiSender {
      */
     private fun restartInstance() {
         val name: String
+        val json: String?
         synchronized(this) {
             if (!running) return
             name = sourceName
+            json = configJson
         }
 
         Log.w(TAG, "proactively recreating NDI sender instance ahead of the Advanced SDK's " +
@@ -117,7 +135,7 @@ class NdiSender {
         Thread.sleep(250)
         nativeDestroy(oldPtr)
 
-        val newPtr = nativeCreate(name)
+        val newPtr = nativeCreate(name, json)
         if (newPtr == 0L) {
             Log.e(TAG, "proactive restart: nativeCreate failed after freeing the old instance " +
                     "— NDI source is temporarily down; will keep retrying on schedule")

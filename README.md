@@ -272,29 +272,39 @@ If some other receiver ever turns out to need the preview stream, `EncoderStream
 `CameraCapture.kt` still takes an `isPreview` flag — reintroducing it is adding a second instance
 back into the `streams` list in `start()`, not rebuilding the mechanism.
 
-## Open: Millumin sometimes slow to connect
+## Fixed: Millumin sometimes slow to connect (up to ~60s, even on a fresh launch)
 
-Not yet reproduced on demand, so not yet diagnosed — recorded so the next occurrence has
-somewhere to start instead of beginning cold.
+Root cause: **the advertised "machine name" was the literal string `"localhost"`.**
 
-Ruled out directly:
-- App-side startup latency. NDI sender is ready ~13ms after `startCapture()`, and both encoders
-  are producing frames within ~700ms. Too fast to explain a noticeable wait on its own.
-- A changing listen port across app restarts. Confirmed via `netstat` on the device: the port
-  (5960/5961) is identical across separate launches, so it is not mDNS holding a stale port.
+`gethostname()` on Android always returns `"localhost"` — there is no real per-device network
+hostname (confirmed directly: `/proc/sys/kernel/hostname` reads `localhost` on the S7, and
+`getprop net.hostname` is empty). The NDI SDK uses that as the machine-name half of the
+advertised source name (`MACHINE_NAME (SOURCE_NAME)`), so this app's source browsed on the
+network as `LOCALHOST (SM-G930W8 (NDI Camera Test))`.
 
-Two live candidates, pointing at different fixes, so it matters which one actually happens:
-- **Stale connection after an ungraceful exit.** If the process dies without
-  `NdiSender.stop()` running (force-stop, crash, OS kill under memory pressure) no clean NDI
-  "goodbye" is sent, and Millumin may hold a dead connection until its own timeout expires
-  before retrying. Fixable app-side, e.g. hooking `onDestroy`/`onTaskRemoved` more defensively.
-- **mDNS/Wi-Fi discovery variability.** NDI discovery is UDP multicast, which has no delivery
-  guarantee; AP-level IGMP snooping, packet loss, or channel congestion can occasionally stretch
-  the query/response round-trip. Largely outside the app's control.
+That's not just a cosmetic problem. NDI's own docs warn that a machine-name clash "is
+incompatible with mDNS and can cause all other sources not to work correctly," and `"localhost"`
+is about the worst possible name to advertise under: it's a reserved word that many mDNS
+resolvers (confirmed on macOS) special-case as always-meaning-loopback and refuse to resolve
+over multicast like a normal name, regardless of what NDI itself actually published. Confirmed
+directly with a throwaway NDI receiver (`gap_timer`, this repo's own test tooling): connecting to
+the `LOCALHOST`-named source succeeded immediately (source found, connect call returned) but
+delivered **zero video frames in 25 seconds** — "connected," but nothing arriving, exactly
+matching the reported symptom. `dns-sd -B _ndi._tcp` also showed the phone's own mDNS
+advertisement literally reading `LOCALHOST (...)`, confirming this wasn't receiver-side.
 
-Next time it happens, the useful facts to capture: had the app just been restarted (and how —
-task-switcher, crash, normal exit), had the screen been off first, and whether Millumin itself
-had been freshly reopened or was already running.
+Fix: pass a JSON `p_config_data` string overriding `ndi.machinename` to something unique per
+device, at `NDIlib_send_create_v2` — see `NdiSender.kt` (`start()`/`restartInstance()`, which
+both now build and pass this) and `ndi_jni.cpp` (`nativeCreate`, which forwards it). The name is
+derived in `MainActivity.kt` from `Build.MODEL` + the last 6 characters of `ANDROID_ID`
+(sanitized to alnum/dash, since it's interpolated into a hand-built JSON literal) — stable across
+app restarts on one device, and unique enough across devices to avoid the exact clash this bug
+was caused by. Re-verified after the fix with the same receiver: connect-to-first-frame dropped
+to ~3.5s (normal codec/keyframe startup), 466 frames delivered in a 20s window, no long stalls —
+against 0 frames in 25s before.
+
+This — not the 30-minute trial-limit swap gap (see above) — was the cause of the "won't connect
+for a long time" reports that persisted even on fresh app launches with no swap involved.
 
 ## Status
 

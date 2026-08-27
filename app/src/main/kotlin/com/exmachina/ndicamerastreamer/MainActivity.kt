@@ -224,7 +224,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         startForegroundService(Intent(this, StreamingService::class.java))
 
         val deviceLabel = android.os.Build.MODEL ?: "Android"
-        if (!ndiSender.start("$deviceLabel (NDI Camera Test)")) {
+        // Android has no real network hostname (gethostname() is always literally "localhost"
+        // here), which the NDI SDK otherwise uses as the advertised "machine name" — see
+        // NdiSender.start() for why that broke reconnection. ANDROID_ID is stable across
+        // restarts of this app on this device and unique per device, which is exactly what the
+        // NDI docs require of a manually-set machine name (a clash on the network reproduces
+        // the same bug this works around).
+        val androidId = android.provider.Settings.Secure.getString(
+            contentResolver, android.provider.Settings.Secure.ANDROID_ID
+        ) ?: "unknown"
+        // Sanitized (not just interpolated raw) because this ends up inside a hand-built JSON
+        // string literal in NdiSender.kt — Build.MODEL is normally plain alnum/dash/space, but
+        // nothing guarantees a device vendor never puts a quote or backslash in it.
+        val machineName = "$deviceLabel-${androidId.takeLast(6)}"
+            .filter { it.isLetterOrDigit() || it == '-' }
+        if (!ndiSender.start("$deviceLabel (NDI Camera Test)", machineName)) {
             statusText.text = "NDI init failed — see logcat"
             return
         }
